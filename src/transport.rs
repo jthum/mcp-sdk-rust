@@ -6,16 +6,19 @@ use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
-use crate::types::{JsonRpcRequest, JsonRpcResponse};
 
 #[async_trait]
 pub trait Transport {
     async fn send<T: Serialize + Send + Sync>(&self, message: T) -> Result<()>;
     async fn receive<T: DeserializeOwned + Send + Sync>(&self) -> Result<T>;
+    async fn close(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Transport over Stdio of a subprocess
 pub struct StdioTransport {
+    #[allow(dead_code)]
     child: Mutex<Child>,
     reader: Mutex<BufReader<tokio::process::ChildStdout>>,
     writer: Mutex<tokio::process::ChildStdin>,
@@ -23,13 +26,13 @@ pub struct StdioTransport {
 
 impl StdioTransport {
     pub fn new(command: &str, args: &[&str]) -> Result<Self> {
-        let mut child = Command::new(command)
-            .args(args)
+        let mut cmd = Command::new(command);
+        cmd.args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
-            .spawn()
-            .context("Failed to spawn MCP server process")?;
+            .kill_on_drop(true);
+        let mut child = cmd.spawn().context("Failed to spawn MCP server process")?;
 
         let stdin = child.stdin.take().context("Failed to open stdin")?;
         let stdout = child.stdout.take().context("Failed to open stdout")?;
@@ -63,5 +66,21 @@ impl Transport for StdioTransport {
         let message: T = serde_json::from_str(&line)
             .with_context(|| format!("Failed to parse MCP message: {}", line))?;
         Ok(message)
+    }
+
+    async fn close(&self) -> Result<()> {
+        {
+            let mut writer = self.writer.lock().await;
+            let _ = writer.shutdown().await;
+        }
+
+        let mut child = self.child.lock().await;
+        if child.try_wait()?.is_some() {
+            return Ok(());
+        }
+
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        Ok(())
     }
 }

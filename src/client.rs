@@ -4,7 +4,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{oneshot, Mutex};
 
 use crate::transport::Transport;
 use crate::types::*;
@@ -22,11 +22,11 @@ impl<T: Transport + Send + Sync + 'static> McpClient<T> {
             next_id: AtomicI64::new(1),
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
         };
-        
+
         // Spawn a background task to read responses
         let transport_clone = client.transport.clone();
         let pending_clone = client.pending_requests.clone();
-        
+
         tokio::spawn(async move {
             loop {
                 match transport_clone.receive::<JsonRpcResponse>().await {
@@ -51,7 +51,11 @@ impl<T: Transport + Send + Sync + 'static> McpClient<T> {
         client
     }
 
-    async fn request<P: Serialize + Send + Sync>(&self, method: &str, params: Option<P>) -> Result<Value> {
+    async fn request<P: Serialize + Send + Sync>(
+        &self,
+        method: &str,
+        params: Option<P>,
+    ) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let params_value = match params {
             Some(p) => Some(serde_json::to_value(p)?),
@@ -73,10 +77,16 @@ impl<T: Transport + Send + Sync + 'static> McpClient<T> {
 
         self.transport.send(request).await?;
 
-        let response = rx.await.context("Failed to receive response from MCP server")?;
+        let response = rx
+            .await
+            .context("Failed to receive response from MCP server")?;
 
         if let Some(error) = response.error {
-            return Err(anyhow::anyhow!("MCP Error {}: {}", error.code, error.message));
+            return Err(anyhow::anyhow!(
+                "MCP Error {}: {}",
+                error.code,
+                error.message
+            ));
         }
 
         Ok(response.result.unwrap_or(Value::Null))
@@ -84,19 +94,26 @@ impl<T: Transport + Send + Sync + 'static> McpClient<T> {
 
     pub async fn initialize(&self) -> Result<()> {
         // Minimal init for now
-        let _ = self.request::<Value>("initialize", Some(serde_json::json!({
-            "protocolVersion": "2024-11-05", // Example version
-            "capabilities": {},
-            "clientInfo": { "name": "bedrock-mcp", "version": "0.1.0" }
-        }))).await?;
-        
+        let _ = self
+            .request::<Value>(
+                "initialize",
+                Some(serde_json::json!({
+                    "protocolVersion": "2024-11-05", // Example version
+                    "capabilities": {},
+                    "clientInfo": { "name": "bedrock-mcp", "version": "0.1.0" }
+                })),
+            )
+            .await?;
+
         // Send initialized notification
-        self.transport.send(JsonRpcRequest {
-            jsonrpc: "2.0".to_string(),
-            id: None,
-            method: "notifications/initialized".to_string(),
-            params: None,
-        }).await?;
+        self.transport
+            .send(JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                id: None,
+                method: "notifications/initialized".to_string(),
+                params: None,
+            })
+            .await?;
 
         Ok(())
     }
@@ -113,5 +130,32 @@ impl<T: Transport + Send + Sync + 'static> McpClient<T> {
         };
         let result = self.request("tools/call", Some(params)).await?;
         serde_json::from_value(result).context("Failed to parse call_tool result")
+    }
+
+    pub async fn shutdown(&self) -> Result<()> {
+        let shutdown_result = self.request::<()>("shutdown", None).await;
+        let _ = self
+            .transport
+            .send(JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                id: None,
+                method: "exit".to_string(),
+                params: None,
+            })
+            .await;
+        let close_result = self.transport.close().await;
+
+        if let Err(err) = shutdown_result {
+            if let Err(close_err) = close_result {
+                return Err(anyhow::anyhow!(
+                    "MCP shutdown request failed: {}; transport close failed: {}",
+                    err,
+                    close_err
+                ));
+            }
+            return Err(err);
+        }
+
+        close_result
     }
 }
